@@ -1,0 +1,102 @@
+$DCs = @(
+    "192.168.10.10",
+    "192.168.10.11",
+    "192.168.10.140",
+    "192.168.10.141"
+)
+
+$LogPath = "C:\ADreplication_Reports"
+$MetricPath = "C:\Program Files\windows_exporter\textfile_inputs"
+$MetricFile = "$MetricPath\ad_replication_status.prom"
+
+foreach ($p in @($LogPath, $MetricPath)) {
+    if (!(Test-Path $p)) {
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+    }
+}
+
+$Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$LogFile = "$LogPath\ADReplication_$((Get-Date).ToString('yyyyMMdd')).log"
+
+$Metrics = @()
+$GlobalError = 0
+
+foreach ($DC in $DCs) {
+
+    Add-Content $LogFile "$Timestamp === Checking DC $DC ==="
+    $DCError = 0
+
+    # 1️⃣ Ping
+    $PingOK = Test-Connection $DC -Count 1 -Quiet
+    if (-not $PingOK) {
+        Add-Content $LogFile "$Timestamp [CRITICAL] Ping failed"
+        $DCError = 1
+    }
+
+    # 2️⃣ NTDS
+    $NTDSRunning = $false
+    if ($PingOK) {
+        try {
+            $svc = Get-Service -ComputerName $DC -Name NTDS -ErrorAction Stop
+            if ($svc.Status -eq "Running") {
+                $NTDSRunning = $true
+            } else {
+                Add-Content $LogFile "$Timestamp [CRITICAL] NTDS service not running"
+                $DCError = 1
+            }
+        }
+        catch {
+            Add-Content $LogFile "$Timestamp [CRITICAL] NTDS service not reachable"
+            $DCError = 1
+        }
+    }
+
+    # 3️⃣ Replikation – NUR sinnvoll, wenn Ping + NTDS OK
+    if ($PingOK -and $NTDSRunning) {
+
+        $ReplOutput = repadmin /showrepl $DC 2>&1
+
+        if (-not $ReplOutput) {
+            Add-Content $LogFile "$Timestamp [ERROR] repadmin returned no output"
+            $DCError = 1
+        }
+
+        foreach ($line in $ReplOutput) {
+
+            # Harte Fehler
+            if ($line -match "failed|error|fatal|RPC|unavailable") {
+                Add-Content $LogFile "$Timestamp [ERROR] $line"
+                $DCError = 1
+            }
+
+            # Nie repliziert
+            if ($line -match "Last success.*never") {
+                Add-Content $LogFile "$Timestamp [ERROR] Replication never succeeded"
+                $DCError = 1
+            }
+
+            # Inkonsistenz: Erfolg gemeldet, obwohl Basisbedingungen schlecht wären
+            if (-not $PingOK -or -not $NTDSRunning) {
+                if ($line -match "Last success") {
+                    Add-Content $LogFile "$Timestamp [ERROR] Inconsistent state: replication success reported while DC not healthy"
+                    $DCError = 1
+                }
+            }
+        }
+
+        if ($DCError -eq 0) {
+            Add-Content $LogFile "$Timestamp [OK] Replication healthy and consistent"
+        }
+
+    }
+    else {
+        Add-Content $LogFile "$Timestamp [ERROR] Replication check skipped due to DC health issues"
+    }
+
+    if ($DCError -eq 1) { $GlobalError = 1 }
+
+    $Metrics += "ad_replication_dc_status{dc=`"$DC`"} $DCError"
+}
+
+$Metrics += "ad_replication_overall_status $GlobalError"
+$Metrics | Out-File -Encoding ascii -Force $MetricFile
