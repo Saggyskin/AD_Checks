@@ -1,0 +1,64 @@
+[CmdletBinding()]
+param(
+  # Ab wie vielen gefundenen Fehler-Markern soll es CRITICAL sein?
+  [int]$CritThreshold = 1,
+
+  # Optional: nur einen DC prüfen (z.B. -OnlyDC dc1.domain.local)
+  [string]$OnlyDC
+)
+
+function Get-DCs {
+  if ($OnlyDC) { return @($OnlyDC) }
+
+  Import-Module ActiveDirectory -ErrorAction Stop
+  $list = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+  if (-not $list) { throw "No DCs found via AD module." }
+  return $list
+}
+
+try {
+  $dcs = Get-DCs
+} catch {
+  Write-Output "UNKNOWN - Cannot enumerate DCs: $($_.Exception.Message)"
+  exit 3
+}
+
+$issues = @()
+
+foreach ($dc in $dcs) {
+  $out  = & repadmin /showrepl $dc 2>&1
+  $text = ($out | Out-String)
+  $lines = $text -split "`r?`n"
+
+  # Robust auf Fehler prüfen (auch wenn Sprache leicht variiert)
+  $failLines = $lines | Where-Object {
+    $_ -match "(?i)last\s+attempt.*failed" -or
+    $_ -match "(?i)\bresult\b\s+([1-9]\d*)" -or
+    $_ -match "(?i)replication operation failed" -or
+    $_ -match "(?i)0x[0-9a-f]{4,}" # Hex-Fehlercodes als Marker
+  }
+
+  if ($failLines.Count -gt 0) {
+    $issues += [PSCustomObject]@{
+      DC     = $dc
+      Count  = $failLines.Count
+      Sample = (($failLines | Select-Object -First 3) -join " | ")
+    }
+  }
+}
+
+$totalFailures = ($issues | Measure-Object -Property Count -Sum).Sum
+if (-not $totalFailures) { $totalFailures = 0 }
+
+# OK
+if ($totalFailures -lt $CritThreshold) {
+  Write-Output "OK - AD replication healthy on $($dcs.Count) DC(s)."
+  exit 0
+}
+
+# CRITICAL -> "Alarm"
+$detail = $issues | ForEach-Object { "$($_.DC): $($_.Count) issue(s) - $($_.Sample)" }
+$msg = "CRITICAL - Replication problems detected (markers total: $totalFailures). " + ($detail -join " || ")
+
+Write-Output $msg
+exit 2
