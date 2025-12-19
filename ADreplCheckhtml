@@ -1,0 +1,58 @@
+[CmdletBinding()]
+param(
+  [int]$CritThreshold = 1,
+  [string]$ReportPath = "C:\Reports\AD_Replication_Report.html"
+)
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+$dcs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+$results = @()
+
+foreach ($dc in $dcs) {
+  $out   = & repadmin /showrepl $dc 2>&1
+  $text  = ($out | Out-String)
+  $lines = $text -split "`r?`n"
+
+  $failLines = $lines | Where-Object {
+    $_ -match "(?i)last\s+attempt.*failed" -or
+    $_ -match "(?i)\bresult\b\s+([1-9]\d*)" -or
+    $_ -match "(?i)replication operation failed"
+  }
+
+  $status = if ($failLines.Count -gt 0) { "CRITICAL" } else { "OK" }
+
+  $results += [PSCustomObject]@{
+    DomainController = $dc
+    Status           = $status
+    FailureCount     = $failLines.Count
+    Details          = if ($failLines) { ($failLines | Select-Object -First 3) -join " | " } else { "No errors" }
+  }
+}
+
+# HTML Styling
+$style = @"
+<style>
+body { font-family: Segoe UI; background:#f4f4f4; }
+table { border-collapse: collapse; width:100%; background:white; }
+th, td { padding:8px; border:1px solid #ccc; }
+th { background:#2c3e50; color:white; }
+.OK { background:#d4edda; }
+.CRITICAL { background:#f8d7da; }
+</style>
+"@
+
+$results | ConvertTo-Html -Title "AD Replication Status" -Head $style `
+  -PreContent "<h1>Active Directory Replication Report</h1><p>Generated: $(Get-Date)</p>" |
+  Out-File $ReportPath -Encoding UTF8
+
+# Alarm-Logik
+$totalFailures = ($results | Measure-Object -Property FailureCount -Sum).Sum
+
+if ($totalFailures -ge $CritThreshold) {
+  Write-Output "CRITICAL - AD replication issues detected. Report: $ReportPath"
+  exit 2
+}
+
+Write-Output "OK - AD replication healthy. Report: $ReportPath"
+exit 0
